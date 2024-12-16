@@ -3,11 +3,8 @@ from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
-from ryu.lib.packet import packet, ethernet, arp, vlan
+from ryu.lib.packet import packet, ethernet, vlan
 from ryu.ofproto import ofproto_v1_3
-import logging
-import logging.handlers
-
 
 class VLANSwitch(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -15,20 +12,6 @@ class VLANSwitch(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(VLANSwitch, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
-        self.logger.setLevel(logging.INFO)
-
-        # File handler to log events to a file
-        file_handler = logging.FileHandler("ryu_events.log")
-        file_handler.setLevel(logging.INFO)
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(formatter)
-        self.logger.addHandler(file_handler)
-
-        # Socket handler to send logs to a remote socket
-        socket_handler = logging.handlers.SocketHandler('127.0.0.1', 9999)  # Replace with your desired IP/port
-        socket_handler.setLevel(logging.INFO)
-        socket_handler.setFormatter(formatter)
-        self.logger.addHandler(socket_handler)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -41,14 +24,13 @@ class VLANSwitch(app_manager.RyuApp):
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions)
 
-        self.logger.info(f"Switch connected: DPID={datapath.id}")
-
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
 
+        # Add a flow entry with a unique match condition (e.g., include timestamp or source IP)
         if buffer_id:
             mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
                                     priority=priority, match=match, instructions=inst)
@@ -56,8 +38,12 @@ class VLANSwitch(app_manager.RyuApp):
             mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
                                     match=match, instructions=inst)
 
+        # Send the flow modification message to add the flow entry without replacing the existing ones
         datapath.send_msg(mod)
-        self.logger.info(f"Flow added: DPID={datapath.id}, Match={match}, Actions={actions}")
+        
+        # Include a timestamp or sequence number in the log to differentiate identical entries
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.logger.info(f"New flow added at {timestamp} with match: {match} and actions: {actions}")
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
@@ -70,12 +56,16 @@ class VLANSwitch(app_manager.RyuApp):
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
 
-        if eth:
-            self.log_packet_details(pkt, in_port)
+        # Check for VLAN tag
+        vlan_header = pkt.get_protocol(vlan.vlan)
+        if vlan_header:
+            vlan_id = vlan_header.vid
+            self.logger.info("VLAN packet received: VLAN ID %s", vlan_id)
+            self.handle_vlan_packet(datapath, in_port, pkt, vlan_id, msg)
+        else:
+            self.handle_non_vlan_packet(datapath, in_port, pkt, msg)
 
-        self.handle_packet(datapath, in_port, pkt, msg)
-
-    def handle_packet(self, datapath, in_port, pkt, msg):
+    def handle_vlan_packet(self, datapath, in_port, pkt, vlan_id, msg):
         parser = datapath.ofproto_parser
         ofproto = datapath.ofproto
 
@@ -85,6 +75,7 @@ class VLANSwitch(app_manager.RyuApp):
         dpid = format(datapath.id, "d").zfill(16)
         self.mac_to_port.setdefault(dpid, {})
 
+        # Learn the source MAC address
         self.mac_to_port[dpid][src] = in_port
 
         if dst in self.mac_to_port[dpid]:
@@ -93,33 +84,90 @@ class VLANSwitch(app_manager.RyuApp):
             out_port = ofproto.OFPP_FLOOD
 
         actions = [parser.OFPActionOutput(out_port)]
+
+        outer_vlan = None
+        inner_vlan = None
+
+        # Check if the packet has a VLAN header
+        vlan_headers = pkt.get_protocols(vlan.vlan)
+
+        if vlan_headers:
+            # The first VLAN header is the outer VLAN tag
+            outer_vlan = vlan_headers[0].vid
+            self.logger.info("Outer VLAN packet received: VLAN ID %s", outer_vlan)
+
+            # If there is a second VLAN header, it is the inner VLAN tag
+            if len(vlan_headers) > 1:
+                inner_vlan = vlan_headers[1].vid
+                self.logger.info("Inner VLAN packet received: VLAN ID %s", inner_vlan)
+
+        # Match on the outer VLAN ID
+        if outer_vlan:
+            match = parser.OFPMatch(in_port=in_port, eth_dst=dst, vlan_vid=(0x1000 | outer_vlan))
+        else:
+            match = parser.OFPMatch(in_port=in_port, eth_dst=dst, vlan_vid=(0x1000 | vlan_id))
+
+        # Add flow entry with timestamp
+        self.add_flow(datapath, 1, match, actions)
+
+        # Log packet flow and Wireshark-like capture
+        self.wireshark_packet_capture(pkt, src, dst, in_port, out_port, outer_vlan if outer_vlan else vlan_id)
+
+        # Check if buffer_id is 0xffffffff (NO_BUFFER)
+        if msg.buffer_id == 0xffffffff:
+            data = pkt.data  # If buffer_id is NO_BUFFER, use the packet data
+        else:
+            data = None  # If not, don't include packet data in the message
+
+        # Send packet out
+        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
+                                in_port=in_port, actions=actions, data=data)
+        datapath.send_msg(out)
+
+    def handle_non_vlan_packet(self, datapath, in_port, pkt, msg):
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
+
+        eth = pkt.get_protocol(ethernet.ethernet)
+        dst = eth.dst
+        src = eth.src
+        dpid = format(datapath.id, "d").zfill(16)
+        self.mac_to_port.setdefault(dpid, {})
+
+        # Learn the source MAC address
+        self.mac_to_port[dpid][src] = in_port
+
+        if dst in self.mac_to_port[dpid]:
+            out_port = self.mac_to_port[dpid][dst]
+        else:
+            out_port = ofproto.OFPP_FLOOD
+
+        actions = [parser.OFPActionOutput(out_port)]
+
+        # Match on Ethernet source and destination without VLAN
         match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
         self.add_flow(datapath, 1, match, actions)
 
-        if msg.buffer_id == 0xffffffff:
-            data = pkt.data
-        else:
-            data = None
+        # Log packet flow and Wireshark-like capture
+        self.wireshark_packet_capture(pkt, src, dst, in_port, out_port)
 
+        # Check if buffer_id is 0xffffffff (NO_BUFFER)
+        if msg.buffer_id == 0xffffffff:
+            data = pkt.data  # If buffer_id is NO_BUFFER, use the packet data
+        else:
+            data = None  # If not, don't include packet data in the message
+
+        # Send packet out
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
                                   in_port=in_port, actions=actions, data=data)
         datapath.send_msg(out)
 
-    def log_packet_details(self, pkt, in_port):
-        eth_pkt = pkt.get_protocol(ethernet.ethernet)
-        arp_pkt = pkt.get_protocol(arp.arp)
-
-        if eth_pkt:
-            ethertype = eth_pkt.ethertype
-            self.logger.info(f"Ethernet Packet: Src={eth_pkt.src}, Dst={eth_pkt.dst}, Ethertype={ethertype}, Port={in_port}")
-
-        if arp_pkt:
-            self.logger.info(f"ARP Packet: Opcode={arp_pkt.opcode}, Src_IP={arp_pkt.src_ip}, Dst_IP={arp_pkt.dst_ip}, Src_MAC={arp_pkt.src_mac}, Dst_MAC={arp_pkt.dst_mac}")
-
     def wireshark_packet_capture(self, pkt, src, dst, in_port, out_port, vlan_id=None):
+        # Log every packet received, regardless of whether a new flow is added
         eth_pkt = pkt.get_protocol(ethernet.ethernet)
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        
         ethertype = eth_pkt.ethertype
-
         ether_type_map = {
             0x0800: "IPv4",
             0x0806: "ARP",
@@ -127,7 +175,20 @@ class VLANSwitch(app_manager.RyuApp):
             0x8847: "MPLS",
             0x8848: "MPLS",
             0x8100: "VLAN",
+            0x88cc: "LLC",
+            0x880b: "PPPoE",
+            0x884d: "PPP",
+            0x8808: "Ethernet Flow Control",
         }
+        protocol = ether_type_map.get(ethertype, "Unknown")
 
-        ether_type_str = ether_type_map.get(ethertype, "Unknown")
-        self.logger.info(f"Packet captured: Src={src}, Dst={dst}, In_Port={in_port}, Out_Port={out_port}, EtherType={ether_type_str}")
+        if vlan_id:
+            self.logger.info(f"[Wireshark Capture] Timestamp: {timestamp} | "
+                            f"VLAN: {vlan_id} | Src: {src} -> Dst: {dst} | "
+                            f"In Port: {in_port} | Out Port: {out_port} | "
+                            f"Ethernet Type: {protocol}")
+        else:
+            self.logger.info(f"[Wireshark Capture] Timestamp: {timestamp} | "
+                            f"Src: {src} -> Dst: {dst} | In Port: {in_port} | "
+                            f"Out Port: {out_port} | Ethernet Type: {protocol}")
+
